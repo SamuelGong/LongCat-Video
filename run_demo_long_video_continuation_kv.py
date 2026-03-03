@@ -15,7 +15,7 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 from torchvision.io import write_video
 from diffusers.utils import load_video
 
-from longcat_video.pipeline_longcat_video import LongCatVideoPipeline
+from longcat_video.pipeline_longcat_video_kv import LongCatVideoPipelineKV
 from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
 from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel
@@ -77,7 +77,7 @@ def generate(args):
     if enable_compile:
         dit = torch.compile(dit)
 
-    pipe = LongCatVideoPipeline(
+    pipe = LongCatVideoPipelineKV(
         tokenizer = tokenizer,
         text_encoder = text_encoder,
         vae = vae,
@@ -146,6 +146,7 @@ def generate(args):
         print(f"Frames per segment (new): {frames_per_segment}")
         print(f"Condition frames: {num_cond_frames}")
         print(f"Total frames per segment: {num_frames}")
+        print(f"KV cache reuse: ENABLED")
 
     # Initialize
     all_generated_frames = video.copy()  # 包含输入视频的所有帧
@@ -160,6 +161,7 @@ def generate(args):
         "segments": [],
         "model_loading_time": 0,
         "video_loading_time": 0,
+        "kv_cache_reused_segments": [],
     }
     
     # Start total timing
@@ -196,38 +198,12 @@ def generate(args):
             print(f"Condition frames: {len(cond_video)} frames")
             print(f"Will generate: {num_frames} frames (including {num_cond_frames} condition frames)")
             print(f"Will keep: {frames_per_segment} new frames")
+            if prev_cond_latents is not None:
+                print(f"Previous condition latents available for KV cache reuse check")
         
-        # KV cache复用：检查条件帧是否与前一个segment相同
-        # 注意：由于generate_vc内部会重新调用_cache_clean_latents，KV cache会被重新计算
-        # 这里我们只是检测并记录，实际的复用需要在pipeline层面实现
-        reuse_kv_cache = False
-        curr_cond_latents = None
-        
-        if prev_cond_latents is not None:
-            # 计算当前条件帧的latents（与generate_vc内部逻辑一致）
-            from diffusers.utils import retrieve_latents
-            # 获取目标分辨率
-            height, width = pipe.get_condition_shape(cond_video, args.resolution)
-            # 预处理条件帧视频
-            cond_video_tensor = pipe.video_processor.preprocess_video(cond_video, height=height, width=width)
-            cond_video_tensor = cond_video_tensor.to(device=local_rank, dtype=pipe.vae.dtype)
-            # VAE编码条件帧
-            encoded_cond = pipe.vae.encode(cond_video_tensor)
-            curr_cond_latents = retrieve_latents(encoded_cond, generator)
-            curr_cond_latents = curr_cond_latents.to(dtype=pipe.dit.dtype)
-            curr_cond_latents = pipe.normalize_latents(curr_cond_latents)
-            
-            # 比较条件帧latents是否相同（允许小的数值误差）
-            if curr_cond_latents.shape == prev_cond_latents.shape:
-                if torch.allclose(curr_cond_latents, prev_cond_latents, rtol=1e-5, atol=1e-6):
-                    reuse_kv_cache = True
-                    if local_rank == 0:
-                        print(f"Note: Condition frames match previous segment, but KV cache will be recalculated")
-                        print(f"      (KV cache reuse requires pipeline modification)")
-        
-        # Generate video continuation
+        # Generate video continuation with KV cache reuse support
         segment_start_time = time.time()
-        output = pipe.generate_vc(
+        output, curr_cond_latents = pipe.generate_vc(
             video=cond_video,
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -240,8 +216,18 @@ def generate(args):
             use_kv_cache=True,
             offload_kv_cache=args.offload_kv_cache,
             enhance_hf=args.enhance_hf,
-        )[0]
+            prev_cond_latents=prev_cond_latents,  # 传入前一个segment的条件帧latents用于KV cache复用
+        )
         segment_generation_time = time.time() - segment_start_time
+        
+        # Check if KV cache was reused
+        kv_cache_reused = False
+        if prev_cond_latents is not None:
+            if torch.allclose(curr_cond_latents, prev_cond_latents, rtol=1e-5, atol=1e-6):
+                kv_cache_reused = True
+                timing_info["kv_cache_reused_segments"].append(segment_idx + 1)
+                if local_rank == 0:
+                    print(f"✓ KV cache reused from previous segment (condition frames match)")
 
         # Post-process output
         # Handle both numpy array and list cases
@@ -273,22 +259,8 @@ def generate(args):
         # 使用新生成的视频的最后num_cond_frames帧作为下一块的条件
         current_video = new_video[-num_cond_frames:]
         
-        # 保存当前segment的条件帧latents，用于下一个segment的KV cache复用检查
-        # 注意：这里保存的是当前segment生成后，用于下一个segment的条件帧latents
-        # 如果下一个segment的条件帧相同，理论上可以复用KV cache（但需要pipeline支持）
-        if curr_cond_latents is not None:
-            prev_cond_latents = curr_cond_latents.clone().detach()
-        else:
-            # 如果没有计算curr_cond_latents（第一个segment），需要从generate_vc内部获取
-            # 但由于generate_vc不返回cond_latents，我们需要重新计算
-            from diffusers.utils import retrieve_latents
-            height, width = pipe.get_condition_shape(current_video, args.resolution)
-            cond_video_tensor = pipe.video_processor.preprocess_video(current_video, height=height, width=width)
-            cond_video_tensor = cond_video_tensor.to(device=local_rank, dtype=pipe.vae.dtype)
-            encoded_cond = pipe.vae.encode(cond_video_tensor)
-            prev_cond_latents = retrieve_latents(encoded_cond, generator)
-            prev_cond_latents = prev_cond_latents.to(dtype=pipe.dit.dtype)
-            prev_cond_latents = pipe.normalize_latents(prev_cond_latents)
+        # 保存当前segment的条件帧latents，用于下一个segment的KV cache复用
+        prev_cond_latents = curr_cond_latents.clone().detach()
         
         segment_total_time = time.time() - segment_start_time
         timing_info["segments"].append({
@@ -296,12 +268,15 @@ def generate(args):
             "generation_time": segment_generation_time,
             "total_time": segment_total_time,
             "frames_generated": len(new_frames_only),
+            "kv_cache_reused": kv_cache_reused,
         })
         
         if local_rank == 0:
             print(f"Segment {segment_idx + 1} complete: generated {len(new_frames_only)} new frames")
             print(f"  Generation time: {segment_generation_time:.2f}s")
             print(f"  Total segment time: {segment_total_time:.2f}s")
+            if kv_cache_reused:
+                print(f"  KV cache reused: Yes")
             print(f"Total frames so far: {len(all_generated_frames)}")
             
             # Save intermediate result
@@ -324,6 +299,7 @@ def generate(args):
         print(f"Total time: {total_time:.2f}s")
         print(f"Model loading time: {timing_info['model_loading_time']:.2f}s")
         print(f"Video loading time: {timing_info['video_loading_time']:.2f}s")
+        print(f"KV cache reused in {len(timing_info['kv_cache_reused_segments'])} segments: {timing_info['kv_cache_reused_segments']}")
         print(f"{'='*60}\n")
         
         # Ensure we have exactly the target number of frames
@@ -345,7 +321,7 @@ def generate(args):
 
 
 def _parse_args():
-    parser = argparse.ArgumentParser(description="Long video continuation with fixed context window")
+    parser = argparse.ArgumentParser(description="Long video continuation with fixed context window and KV cache reuse")
     
     # Input/Output
     parser.add_argument(
@@ -357,7 +333,7 @@ def _parse_args():
     parser.add_argument(
         "--output_path",
         type=str,
-        default="output_long_continuation.mp4",
+        default="output_long_continuation_kv.mp4",
         help="Path to save output video"
     )
     parser.add_argument(
@@ -476,9 +452,11 @@ if __name__ == "__main__":
 
 
 '''
-torchrun --nproc_per_node=8 run_demo_long_video_continuation.py \
+Example command:
+
+torchrun --nproc_per_node=1 run_demo_long_video_continuation_kv.py \
     --input_video assets/motorcycle.mp4 \
-    --output_path output_long.mp4 \
+    --output_path output_long_kv.mp4 \
     --prompt "A person rides a motorcycle along a long, straight road that stretches between a body of water and a forested hillside. The rider steadily accelerates, keeping the motorcycle centered between the guardrails, while the scenery passes by on both sides." \
     --checkpoint_dir ./weights/LongCat-Video \
     --total_target_frames 500 \
