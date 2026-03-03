@@ -93,13 +93,31 @@ def generate(args):
     # Load and preprocess input video
     video = load_video(video_path)
     target_fps = args.target_fps
-    target_size = video[0].size  # (width, height)
+    # Get target size - handle both numpy array and PIL Image list cases
+    if isinstance(video, np.ndarray):
+        # numpy array: shape is (num_frames, height, width, channels)
+        target_size = (video.shape[2], video.shape[1])  # (width, height)
+    elif isinstance(video, list) and len(video) > 0:
+        # PIL Image list or numpy array list
+        if hasattr(video[0], 'size'):
+            target_size = video[0].size  # (width, height) for PIL Image
+        else:
+            # numpy array in list
+            target_size = (video[0].shape[1], video[0].shape[0])  # (width, height)
+    else:
+        raise ValueError(f"Unexpected video format: {type(video)}")
+    
     current_fps = get_fps(video_path)
     stride = max(1, round(current_fps / target_fps))
     
     # Preprocess input video frames
     video = video[::stride]
-    video = [(video[i] * 255).astype(np.uint8) for i in range(video.shape[0])]
+    # Handle both list and numpy array cases
+    if isinstance(video, np.ndarray):
+        video = [(video[i] * 255).astype(np.uint8) for i in range(video.shape[0])]
+    else:
+        # If video is a list, convert to numpy array first or process directly
+        video = [(np.array(video[i]) * 255).astype(np.uint8) for i in range(len(video))]
     video = [PIL.Image.fromarray(img) for img in video]
     
     # Calculate number of segments needed
@@ -169,7 +187,12 @@ def generate(args):
         )[0]
 
         # Post-process output
-        new_video = [(output[i] * 255).astype(np.uint8) for i in range(output.shape[0])]
+        # Handle both numpy array and list cases
+        if isinstance(output, np.ndarray):
+            new_video = [(output[i] * 255).astype(np.uint8) for i in range(output.shape[0])]
+        else:
+            # If output is a list, convert to numpy array first or process directly
+            new_video = [(np.array(output[i]) * 255).astype(np.uint8) for i in range(len(output))]
         new_video = [PIL.Image.fromarray(img) for img in new_video]
         new_video = [frame.resize(target_size, PIL.Image.BICUBIC) for frame in new_video]
         del output
