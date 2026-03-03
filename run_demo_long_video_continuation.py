@@ -356,11 +356,11 @@ if __name__ == "__main__":
 
 
 '''
-torchrun --nproc_per_node=1 run_demo_long_video_continuation.py \
+torchrun --nproc_per_node=8 run_demo_long_video_continuation.py \
     --input_video assets/motorcycle.mp4 \
     --output_path output_long.mp4 \
     --prompt "A person rides a motorcycle along a long, straight road that stretches between a body of water and a forested hillside. The rider steadily accelerates, keeping the motorcycle centered between the guardrails, while the scenery passes by on both sides." \
-    --checkpoint_dir /path/to/checkpoint \
+    --checkpoint_dir ./weights/LongCat-Video \
     --total_target_frames 500 \
     --num_cond_frames 13 \
     --frames_per_segment 80 \
