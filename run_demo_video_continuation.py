@@ -217,3 +217,22 @@ def _parse_args():
 if __name__ == "__main__":
     args = _parse_args()
     generate(args)
+
+'''
+torchrun --nproc_per_node=1 run_demo_long_video_continuation.py \
+    --input_video assets/motorcycle.mp4 \
+    --output_path output_long.mp4 \
+    --prompt "A person rides a motorcycle along a long, straight road that stretches between a body of water and a forested hillside. The rider steadily accelerates, keeping the motorcycle centered between the guardrails, while the scenery passes by on both sides." \
+    --checkpoint_dir /path/to/checkpoint \
+    --total_target_frames 500 \
+    --num_cond_frames 13 \
+    --frames_per_segment 80 \
+    --resolution 480p \
+    --target_fps 15 \
+    --num_inference_steps 50 \
+    --guidance_scale 4.0 \
+    --seed 42 \
+    --context_parallel_size 1 \
+    --enable_compile \
+    --save_intermediate
+'''
