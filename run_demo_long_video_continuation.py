@@ -150,9 +150,6 @@ def generate(args):
     # Initialize
     all_generated_frames = video.copy()  # 包含输入视频的所有帧
     current_video = video  # 当前用于条件的视频（第一块用输入视频）
-    
-    # KV cache复用：保存前一个segment的条件帧latents
-    prev_cond_latents = None  # 前一个segment的条件帧latents（用于KV cache复用）
 
     # Timing information
     timing_info = {
@@ -197,34 +194,6 @@ def generate(args):
             print(f"Will generate: {num_frames} frames (including {num_cond_frames} condition frames)")
             print(f"Will keep: {frames_per_segment} new frames")
         
-        # KV cache复用：检查条件帧是否与前一个segment相同
-        # 注意：由于generate_vc内部会重新调用_cache_clean_latents，KV cache会被重新计算
-        # 这里我们只是检测并记录，实际的复用需要在pipeline层面实现
-        reuse_kv_cache = False
-        curr_cond_latents = None
-        
-        if prev_cond_latents is not None:
-            # 计算当前条件帧的latents（与generate_vc内部逻辑一致）
-            from diffusers.utils import retrieve_latents
-            # 获取目标分辨率
-            height, width = pipe.get_condition_shape(cond_video, args.resolution)
-            # 预处理条件帧视频
-            cond_video_tensor = pipe.video_processor.preprocess_video(cond_video, height=height, width=width)
-            cond_video_tensor = cond_video_tensor.to(device=local_rank, dtype=pipe.vae.dtype)
-            # VAE编码条件帧
-            encoded_cond = pipe.vae.encode(cond_video_tensor)
-            curr_cond_latents = retrieve_latents(encoded_cond, generator)
-            curr_cond_latents = curr_cond_latents.to(dtype=pipe.dit.dtype)
-            curr_cond_latents = pipe.normalize_latents(curr_cond_latents)
-            
-            # 比较条件帧latents是否相同（允许小的数值误差）
-            if curr_cond_latents.shape == prev_cond_latents.shape:
-                if torch.allclose(curr_cond_latents, prev_cond_latents, rtol=1e-5, atol=1e-6):
-                    reuse_kv_cache = True
-                    if local_rank == 0:
-                        print(f"Note: Condition frames match previous segment, but KV cache will be recalculated")
-                        print(f"      (KV cache reuse requires pipeline modification)")
-        
         # Generate video continuation
         segment_start_time = time.time()
         output = pipe.generate_vc(
@@ -244,14 +213,40 @@ def generate(args):
         segment_generation_time = time.time() - segment_start_time
 
         # Post-process output
-        # Handle both numpy array and list cases
-        # Output from generate_vc is [0, 1] range, convert to [0, 255] with proper clipping
+        # Output from generate_vc is shape (B, N, H, W, C) where B is batch size (usually 1)
+        # We need to extract the actual video frames: take first batch -> (N, H, W, C)
         if isinstance(output, np.ndarray):
-            new_video = [(np.clip(output[i], 0, 1) * 255).astype(np.uint8) for i in range(output.shape[0])]
+            # Handle batch dimension: if shape is (B, N, H, W, C), take first batch
+            if output.ndim == 5:
+                output = output[0]  # Remove batch dimension: (N, H, W, C)
+            # Now output should be (N, H, W, C) where N is num_frames
+            # Convert from [0, 1] range to [0, 255] with proper clipping
+            # Each output[i] should be (H, W, C)
+            new_video = []
+            for i in range(output.shape[0]):
+                frame = output[i]  # (H, W, C)
+                # Ensure frame is 2D (H, W, C) for PIL
+                if frame.ndim == 3:
+                    frame = np.clip(frame, 0, 1) * 255
+                    frame = frame.astype(np.uint8)
+                    new_video.append(PIL.Image.fromarray(frame))
+                else:
+                    raise ValueError(f"Unexpected frame shape at index {i}: {frame.shape}, expected (H, W, C)")
         else:
-            # If output is a list, convert to numpy array first or process directly
-            new_video = [(np.clip(np.array(output[i]), 0, 1) * 255).astype(np.uint8) for i in range(len(output))]
-        new_video = [PIL.Image.fromarray(img) for img in new_video]
+            # If output is a list, process each element
+            new_video = []
+            for item in output:
+                frame = np.array(item)
+                # Handle batch dimension if present
+                if frame.ndim == 4:  # (1, H, W, C) or (B, H, W, C)
+                    frame = frame[0]  # Take first batch
+                elif frame.ndim == 5:  # (1, 1, H, W, C) or similar
+                    frame = frame[0, 0]  # Remove batch and extra dimensions
+                # Now should be (H, W, C)
+                frame = np.clip(frame, 0, 1) * 255
+                frame = frame.astype(np.uint8)
+                new_video.append(PIL.Image.fromarray(frame))
+        
         new_video = [frame.resize(target_size, PIL.Image.BICUBIC) for frame in new_video]
         del output
         torch_gc()
@@ -272,23 +267,6 @@ def generate(args):
         # Update current_video for next segment
         # 使用新生成的视频的最后num_cond_frames帧作为下一块的条件
         current_video = new_video[-num_cond_frames:]
-        
-        # 保存当前segment的条件帧latents，用于下一个segment的KV cache复用检查
-        # 注意：这里保存的是当前segment生成后，用于下一个segment的条件帧latents
-        # 如果下一个segment的条件帧相同，理论上可以复用KV cache（但需要pipeline支持）
-        if curr_cond_latents is not None:
-            prev_cond_latents = curr_cond_latents.clone().detach()
-        else:
-            # 如果没有计算curr_cond_latents（第一个segment），需要从generate_vc内部获取
-            # 但由于generate_vc不返回cond_latents，我们需要重新计算
-            from diffusers.utils import retrieve_latents
-            height, width = pipe.get_condition_shape(current_video, args.resolution)
-            cond_video_tensor = pipe.video_processor.preprocess_video(current_video, height=height, width=width)
-            cond_video_tensor = cond_video_tensor.to(device=local_rank, dtype=pipe.vae.dtype)
-            encoded_cond = pipe.vae.encode(cond_video_tensor)
-            prev_cond_latents = retrieve_latents(encoded_cond, generator)
-            prev_cond_latents = prev_cond_latents.to(dtype=pipe.dit.dtype)
-            prev_cond_latents = pipe.normalize_latents(prev_cond_latents)
         
         segment_total_time = time.time() - segment_start_time
         timing_info["segments"].append({

@@ -230,14 +230,40 @@ def generate(args):
                     print(f"✓ KV cache reused from previous segment (condition frames match)")
 
         # Post-process output
-        # Handle both numpy array and list cases
-        # Output from generate_vc is [0, 1] range, convert to [0, 255] with proper clipping
+        # Output from generate_vc is shape (B, N, H, W, C) where B is batch size (usually 1)
+        # We need to extract the actual video frames: take first batch -> (N, H, W, C)
         if isinstance(output, np.ndarray):
-            new_video = [(np.clip(output[i], 0, 1) * 255).astype(np.uint8) for i in range(output.shape[0])]
+            # Handle batch dimension: if shape is (B, N, H, W, C), take first batch
+            if output.ndim == 5:
+                output = output[0]  # Remove batch dimension: (N, H, W, C)
+            # Now output should be (N, H, W, C) where N is num_frames
+            # Convert from [0, 1] range to [0, 255] with proper clipping
+            # Each output[i] should be (H, W, C)
+            new_video = []
+            for i in range(output.shape[0]):
+                frame = output[i]  # (H, W, C)
+                # Ensure frame is 2D (H, W, C) for PIL
+                if frame.ndim == 3:
+                    frame = np.clip(frame, 0, 1) * 255
+                    frame = frame.astype(np.uint8)
+                    new_video.append(PIL.Image.fromarray(frame))
+                else:
+                    raise ValueError(f"Unexpected frame shape at index {i}: {frame.shape}, expected (H, W, C)")
         else:
-            # If output is a list, convert to numpy array first or process directly
-            new_video = [(np.clip(np.array(output[i]), 0, 1) * 255).astype(np.uint8) for i in range(len(output))]
-        new_video = [PIL.Image.fromarray(img) for img in new_video]
+            # If output is a list, process each element
+            new_video = []
+            for item in output:
+                frame = np.array(item)
+                # Handle batch dimension if present
+                if frame.ndim == 4:  # (1, H, W, C) or (B, H, W, C)
+                    frame = frame[0]  # Take first batch
+                elif frame.ndim == 5:  # (1, 1, H, W, C) or similar
+                    frame = frame[0, 0]  # Remove batch and extra dimensions
+                # Now should be (H, W, C)
+                frame = np.clip(frame, 0, 1) * 255
+                frame = frame.astype(np.uint8)
+                new_video.append(PIL.Image.fromarray(frame))
+        
         new_video = [frame.resize(target_size, PIL.Image.BICUBIC) for frame in new_video]
         del output
         torch_gc()
