@@ -220,14 +220,26 @@ def generate(args):
         )
         segment_generation_time = time.time() - segment_start_time
         
-        # Check if KV cache was reused
+        # Check if KV cache was reused (check the actual reuse status from pipeline)
+        # The pipeline already checked and reused KV cache if conditions match
         kv_cache_reused = False
         if prev_cond_latents is not None:
-            if torch.allclose(curr_cond_latents, prev_cond_latents, rtol=1e-5, atol=1e-6):
+            # Compare latents with more lenient tolerance due to VAE encoding randomness
+            max_diff = torch.abs(curr_cond_latents - prev_cond_latents).max().item()
+            mean_diff = torch.abs(curr_cond_latents - prev_cond_latents).mean().item()
+            
+            # Use more lenient tolerance: rtol=1e-3, atol=1e-4 (matching pipeline)
+            if torch.allclose(curr_cond_latents, prev_cond_latents, rtol=1e-3, atol=1e-4):
                 kv_cache_reused = True
                 timing_info["kv_cache_reused_segments"].append(segment_idx + 1)
                 if local_rank == 0:
                     print(f"✓ KV cache reused from previous segment (condition frames match)")
+                    print(f"  Latent diff - max: {max_diff:.6f}, mean: {mean_diff:.6f}")
+            else:
+                if local_rank == 0:
+                    print(f"✗ KV cache NOT reused: condition frames differ")
+                    print(f"  Latent diff - max: {max_diff:.6f}, mean: {mean_diff:.6f}")
+                    print(f"  (This is expected if VAE encoding uses randomness)")
 
         # Post-process output
         # Output from generate_vc is shape (B, N, H, W, C) where B is batch size (usually 1)
@@ -286,6 +298,8 @@ def generate(args):
         current_video = new_video[-num_cond_frames:]
         
         # 保存当前segment的条件帧latents，用于下一个segment的KV cache复用
+        # Note: curr_cond_latents from pipeline are already normalized and ready to use
+        # We save them for next segment comparison
         prev_cond_latents = curr_cond_latents.clone().detach()
         
         segment_total_time = time.time() - segment_start_time

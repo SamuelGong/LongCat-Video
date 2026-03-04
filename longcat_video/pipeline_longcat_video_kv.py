@@ -277,7 +277,9 @@ class LongCatVideoPipelineKV:
                     pad_front = encoded_input[:, :, 0:1].repeat(1, 1, num_cond_frames_added, 1, 1)
                     encoded_input = torch.cat([pad_front, encoded_input], dim=2)
                 assert encoded_input.shape[2] == num_cond_frames
-                latent = retrieve_latents(self.vae.encode(encoded_input), gen)
+                # Use argmax mode for deterministic encoding when comparing for KV cache reuse
+                # This ensures same input produces same latents
+                latent = retrieve_latents(self.vae.encode(encoded_input), gen, sample_mode="argmax")
                 cond_latents.append(latent)
 
             cond_latents = torch.cat(cond_latents, dim=0).to(dtype)
@@ -573,43 +575,87 @@ class LongCatVideoPipelineKV:
         video = video.to(device=device, dtype=prompt_embeds.dtype)
 
         num_channels_latents = self.dit.config.in_channels
-        latents = self.prepare_latents(
-            video=video,
-            batch_size=batch_size * num_videos_per_prompt,
-            num_channels_latents=num_channels_latents,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            num_cond_frames=num_cond_frames,
-            dtype=dit_dtype,
-            device=device,
-            generator=generator,
-            latents=latents,
-        )
+        
+        # For KV cache reuse: if prev_cond_latents is provided, we can potentially reuse them
+        # But we still need to prepare full latents for generation
+        # Extract condition frames for comparison
+        condition_data = video[:, :, -num_cond_frames:]  # [B, 3, num_cond_frames, H, W]
+        num_cond_latents = 1 + (num_cond_frames - 1) // self.vae_scale_factor_temporal
+        
+        # Always encode condition frames with argmax mode for deterministic comparison
+        # This ensures same input produces same latents, enabling KV cache reuse
+        cond_latents_argmax = []
+        for i in range(batch_size * num_videos_per_prompt):
+            encoded_input = condition_data[i][:, -num_cond_frames:].unsqueeze(0)
+            # Use argmax mode for deterministic encoding
+            latent = retrieve_latents(self.vae.encode(encoded_input), None, sample_mode="argmax")
+            cond_latents_argmax.append(latent)
+        cond_latents_argmax = torch.cat(cond_latents_argmax, dim=0).to(dit_dtype)
+        cond_latents_argmax = self.normalize_latents(cond_latents_argmax)
+        
+        # Check if we can reuse previous condition latents
+        reuse_cond_latents = False
+        if prev_cond_latents is not None:
+            # Compare with previous latents (both should be argmax encoded)
+            if cond_latents_argmax.shape == prev_cond_latents.shape:
+                if torch.allclose(cond_latents_argmax, prev_cond_latents, rtol=1e-3, atol=1e-4):
+                    reuse_cond_latents = True
+                    if context_parallel_util.get_cp_rank() == 0:
+                        loguru.logger.info(f"Condition frames match - will reuse latents and KV cache")
+        
+        # Prepare latents (will use reused cond_latents if available)
+        if reuse_cond_latents and prev_cond_latents is not None:
+            # Reuse previous condition latents (already argmax-encoded)
+            num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+            shape = (
+                batch_size * num_videos_per_prompt,
+                num_channels_latents,
+                num_latent_frames,
+                int(height) // self.vae_scale_factor_spatial,
+                int(width) // self.vae_scale_factor_spatial,
+            )
+            # Generate random noise for new frames only
+            latents = torch.randn(shape, generator=generator, device=device, dtype=dit_dtype)
+            # Fill in condition latents (reused from previous segment)
+            latents[:, :, :num_cond_latents] = prev_cond_latents
+            cond_latents = prev_cond_latents
+        else:
+            # Normal preparation, but use argmax-encoded condition latents
+            num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+            shape = (
+                batch_size * num_videos_per_prompt,
+                num_channels_latents,
+                num_latent_frames,
+                int(height) // self.vae_scale_factor_spatial,
+                int(width) // self.vae_scale_factor_spatial,
+            )
+            # Generate random noise
+            latents = torch.randn(shape, generator=generator, device=device, dtype=dit_dtype)
+            # Fill in argmax-encoded condition latents
+            latents[:, :, :num_cond_latents] = cond_latents_argmax
+            cond_latents = cond_latents_argmax
+        
         if context_parallel_util.get_cp_size() > 1:
             context_parallel_util.cp_broadcast(latents)
-
-        num_cond_latents = 1 + (num_cond_frames - 1) // self.vae_scale_factor_temporal
         
         # 6. Denoising loop
         if context_parallel_util.get_cp_size() > 1:
             torch.distributed.barrier(group=context_parallel_util.get_cp_group())
-
-        # Extract current condition latents for comparison and return
-        cond_latents = latents[:, :, :num_cond_latents]
         
         # KV cache reuse logic: check if condition frames match previous segment
-        reuse_kv_cache = False
-        if use_kv_cache and prev_cond_latents is not None:
-            # Compare current condition latents with previous ones
-            if cond_latents.shape == prev_cond_latents.shape:
-                if torch.allclose(cond_latents, prev_cond_latents, rtol=1e-5, atol=1e-6):
-                    reuse_kv_cache = True
-                    # KV cache already exists from previous segment, reuse it
-                    kv_cache_dict = self._get_kv_cache_dict()
-                    if kv_cache_dict is None:
-                        # If somehow KV cache was cleared, recalculate
-                        reuse_kv_cache = False
+        # If we reused condition latents, we can also reuse KV cache
+        reuse_kv_cache = reuse_cond_latents and use_kv_cache
+        if reuse_kv_cache:
+            # KV cache should already exist from previous segment
+            kv_cache_dict = self._get_kv_cache_dict()
+            if kv_cache_dict is None:
+                # If somehow KV cache was cleared, recalculate
+                reuse_kv_cache = False
+                if context_parallel_util.get_cp_rank() == 0:
+                    loguru.logger.warning("KV cache was cleared, recalculating...")
+            else:
+                if context_parallel_util.get_cp_rank() == 0:
+                    loguru.logger.info(f"Reusing KV cache: condition frames match (reused cond_latents)")
         
         if use_kv_cache:
             if not reuse_kv_cache:
